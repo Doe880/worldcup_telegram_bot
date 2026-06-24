@@ -1,10 +1,11 @@
 import os
+import re
 import json
 import html
 import time
 import threading
 from pathlib import Path
-from datetime import datetime, timedelta, time as dt_time
+from datetime import datetime, timedelta, time as dt_time, timezone
 from zoneinfo import ZoneInfo
 from typing import Any
 
@@ -19,18 +20,17 @@ APP_NAME = "worldcup-telegram-reporter"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-FOOTBALL_API_KEY = os.getenv("FOOTBALL_API_KEY", "")
 APP_SECRET = os.getenv("APP_SECRET", "")
 
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Moscow")
-LEAGUE_ID = int(os.getenv("LEAGUE_ID", "1"))
-SEASON = int(os.getenv("SEASON", "2026"))
 
 REPORT_WINDOW_START = os.getenv("REPORT_WINDOW_START", "09:30")
 REPORT_WINDOW_END = os.getenv("REPORT_WINDOW_END", "10:30")
 
-BASE_URL = os.getenv("FOOTBALL_API_BASE_URL", "https://v3.football.api-sports.io")
-FINISHED_STATUSES = {"FT", "AET", "PEN"}
+OPENFOOTBALL_URL = os.getenv(
+    "OPENFOOTBALL_URL",
+    "https://raw.githubusercontent.com/openfootball/worldcup.json/master/2026/worldcup.json",
+)
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -47,7 +47,6 @@ def require_env() -> None:
     for key, value in {
         "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
         "TELEGRAM_CHAT_ID": TELEGRAM_CHAT_ID,
-        "FOOTBALL_API_KEY": FOOTBALL_API_KEY,
         "APP_SECRET": APP_SECRET,
     }.items():
         if not value:
@@ -104,7 +103,6 @@ def is_inside_report_window(current: datetime | None = None) -> bool:
 def load_state() -> dict[str, Any]:
     default_state = {
         "sent": {},
-        "no_matches": {},
         "errors": [],
     }
 
@@ -119,14 +117,11 @@ def load_state() -> dict[str, Any]:
     if not isinstance(data, dict):
         return default_state
 
-    for key in default_state:
-        data.setdefault(key, default_state[key])
+    data.setdefault("sent", {})
+    data.setdefault("errors", [])
 
     if not isinstance(data["sent"], dict):
         data["sent"] = {}
-
-    if not isinstance(data["no_matches"], dict):
-        data["no_matches"] = {}
 
     if not isinstance(data["errors"], list):
         data["errors"] = []
@@ -144,13 +139,6 @@ def save_state(state: dict[str, Any]) -> None:
 def mark_sent(date_str: str) -> None:
     state = load_state()
     state["sent"][date_str] = now_local().isoformat()
-    state["no_matches"].pop(date_str, None)
-    save_state(state)
-
-
-def mark_no_matches(date_str: str) -> None:
-    state = load_state()
-    state["no_matches"][date_str] = now_local().isoformat()
     save_state(state)
 
 
@@ -159,7 +147,7 @@ def mark_error(message: str) -> None:
     state["errors"].append(
         {
             "time": now_local().isoformat(),
-            "message": message[:500],
+            "message": message[:700],
         }
     )
     state["errors"] = state["errors"][-20:]
@@ -168,35 +156,6 @@ def mark_error(message: str) -> None:
 
 def already_sent(date_str: str) -> bool:
     return date_str in load_state().get("sent", {})
-
-
-def already_checked_no_matches(date_str: str) -> bool:
-    return date_str in load_state().get("no_matches", {})
-
-
-def api_get(endpoint: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-    require_env()
-
-    url = f"{BASE_URL}{endpoint}"
-    headers = {
-        "x-apisports-key": FOOTBALL_API_KEY,
-    }
-
-    response = requests.get(
-        url,
-        headers=headers,
-        params=params or {},
-        timeout=30,
-    )
-    response.raise_for_status()
-
-    data = response.json()
-    errors = data.get("errors")
-
-    if errors:
-        raise RuntimeError(f"API-Football error: {errors}")
-
-    return data
 
 
 def telegram_send(text: str) -> None:
@@ -252,462 +211,494 @@ def split_text(text: str, max_len: int = 3900) -> list[str]:
     return parts
 
 
-def get_fixtures_by_date(date_str: str) -> list[dict[str, Any]]:
-    data = api_get(
-        "/fixtures",
-        {
-            "date": date_str,
-            "league": LEAGUE_ID,
-            "season": SEASON,
-            "timezone": TIMEZONE,
-        },
-    )
-
-    return data.get("response", [])
+def load_worldcup_data() -> dict[str, Any]:
+    response = requests.get(OPENFOOTBALL_URL, timeout=30)
+    response.raise_for_status()
+    return response.json()
 
 
-def get_finished_matches(date_str: str) -> list[dict[str, Any]]:
-    fixtures = get_fixtures_by_date(date_str)
-
-    return [
-        fixture
-        for fixture in fixtures
-        if fixture.get("fixture", {}).get("status", {}).get("short")
-        in FINISHED_STATUSES
-    ]
-
-
-def get_fixture_events(fixture_id: int) -> list[dict[str, Any]]:
-    data = api_get(
-        "/fixtures/events",
-        {
-            "fixture": fixture_id,
-        },
-    )
-
-    return data.get("response", [])
-
-
-def get_standings() -> list[list[dict[str, Any]]]:
-    data = api_get(
-        "/standings",
-        {
-            "league": LEAGUE_ID,
-            "season": SEASON,
-        },
-    )
-
-    response = data.get("response", [])
-
-    if not response:
-        return []
-
-    return response[0].get("league", {}).get("standings", [])
-
-
-def get_upcoming_matches(limit: int = 10) -> list[dict[str, Any]]:
-    data = api_get(
-        "/fixtures",
-        {
-            "league": LEAGUE_ID,
-            "season": SEASON,
-            "next": limit,
-            "timezone": TIMEZONE,
-        },
-    )
-
-    return data.get("response", [])
-
-
-def event_minute(event: dict[str, Any]) -> str:
-    time_data = event.get("time", {}) or {}
-    elapsed = time_data.get("elapsed")
-    extra = time_data.get("extra")
-
-    if elapsed is None:
-        return "?"
-
-    if extra:
-        return f"{elapsed}+{extra}’"
-
-    return f"{elapsed}’"
-
-
-def safe_name(value: Any, fallback: str) -> str:
+def safe_text(value: Any, fallback: str = "") -> str:
     if isinstance(value, str) and value.strip():
         return value.strip()
 
     return fallback
 
 
-def format_goals(events: list[dict[str, Any]]) -> list[str]:
-    result = []
-
-    for event in events:
-        if event.get("type") != "Goal":
-            continue
-
-        detail = event.get("detail") or ""
-
-        if detail == "Missed Penalty":
-            continue
-
-        player = safe_name(
-            (event.get("player") or {}).get("name"),
-            "Неизвестный игрок",
-        )
-        team = safe_name(
-            (event.get("team") or {}).get("name"),
-            "Команда",
-        )
-        assist = (event.get("assist") or {}).get("name")
-
-        line = f"{event_minute(event)} — {player} ({team})"
-
-        if detail == "Penalty":
-            line += " — пенальти"
-        elif detail == "Own Goal":
-            line += " — автогол"
-
-        if assist:
-            line += f", пас: {assist}"
-
-        result.append(line)
-
-    return result
+def get_matches(data: dict[str, Any]) -> list[dict[str, Any]]:
+    matches = data.get("matches", [])
+    return matches if isinstance(matches, list) else []
 
 
-def format_red_cards(events: list[dict[str, Any]]) -> list[str]:
-    result = []
+def get_score_ft(match: dict[str, Any]) -> tuple[int | None, int | None]:
+    score = match.get("score") or {}
+    ft = score.get("ft")
 
-    for event in events:
-        if event.get("type") != "Card":
-            continue
+    if (
+        isinstance(ft, list)
+        and len(ft) >= 2
+        and ft[0] is not None
+        and ft[1] is not None
+    ):
+        return int(ft[0]), int(ft[1])
 
-        detail = event.get("detail") or ""
+    return None, None
 
-        if "Red" not in detail and "Second Yellow" not in detail:
-            continue
 
-        player = safe_name(
-            (event.get("player") or {}).get("name"),
-            "Неизвестный игрок",
-        )
-        team = safe_name(
-            (event.get("team") or {}).get("name"),
-            "Команда",
-        )
+def is_finished(match: dict[str, Any]) -> bool:
+    home_score, away_score = get_score_ft(match)
+    return home_score is not None and away_score is not None
 
-        if "Second Yellow" in detail:
-            card_type = "вторая желтая / удаление"
+
+def parse_match_datetime(match: dict[str, Any]) -> datetime:
+    date_value = safe_text(match.get("date"))
+    time_value = safe_text(match.get("time"), "00:00 UTC")
+
+    if not date_value:
+        raise ValueError("Match has no date")
+
+    date_obj = datetime.fromisoformat(date_value).date()
+
+    # Примеры:
+    # "13:00 UTC-6"
+    # "20:00 UTC-5"
+    # "18:00 UTC"
+    pattern = r"^(\d{1,2}):(\d{2})(?:\s*UTC\s*([+-]\d{1,2}))?"
+    match_time = re.search(pattern, time_value)
+
+    if match_time:
+        hour = int(match_time.group(1))
+        minute = int(match_time.group(2))
+        offset_raw = match_time.group(3)
+
+        if offset_raw:
+            offset_hours = int(offset_raw)
         else:
-            card_type = "красная карточка"
+            offset_hours = 0
 
-        result.append(f"{event_minute(event)} — {player} ({team}), {card_type}")
+        source_tz = timezone(timedelta(hours=offset_hours))
+        dt = datetime(
+            date_obj.year,
+            date_obj.month,
+            date_obj.day,
+            hour,
+            minute,
+            tzinfo=source_tz,
+        )
+    else:
+        dt = datetime(
+            date_obj.year,
+            date_obj.month,
+            date_obj.day,
+            0,
+            0,
+            tzinfo=timezone.utc,
+        )
 
-    return result
+    return dt.astimezone(get_tz())
 
 
-def format_match(match: dict[str, Any], events: list[dict[str, Any]]) -> str:
-    home = safe_name(
-        (match.get("teams", {}).get("home") or {}).get("name"),
-        "Хозяева",
-    )
-    away = safe_name(
-        (match.get("teams", {}).get("away") or {}).get("name"),
-        "Гости",
-    )
+def match_moscow_date_str(match: dict[str, Any]) -> str:
+    try:
+        return parse_match_datetime(match).date().isoformat()
+    except Exception:
+        return safe_text(match.get("date"))
 
-    goals_data = match.get("goals") or {}
-    home_goals = goals_data.get("home")
-    away_goals = goals_data.get("away")
 
-    score_text = f"{home_goals}:{away_goals}"
-    round_name = (match.get("league") or {}).get("round") or ""
-    status = (match.get("fixture") or {}).get("status", {}).get("short")
+def format_goal(goal: dict[str, Any], team: str) -> str:
+    name = safe_text(goal.get("name"), "Неизвестный игрок")
+    minute = safe_text(goal.get("minute"), "?")
 
-    lines = [
-        f"<b>{html.escape(home)} {html.escape(score_text)} {html.escape(away)}</b>"
+    detail_parts = []
+
+    goal_type = safe_text(goal.get("type")).lower()
+    if "pen" in goal_type:
+        detail_parts.append("пенальти")
+    if "own" in goal_type or "og" in goal_type:
+        detail_parts.append("автогол")
+
+    detail = f" — {', '.join(detail_parts)}" if detail_parts else ""
+
+    return f"{minute}’ — {name} ({team}){detail}"
+
+
+def get_goals(match: dict[str, Any]) -> list[str]:
+    team1 = safe_text(match.get("team1"), "Команда 1")
+    team2 = safe_text(match.get("team2"), "Команда 2")
+
+    goals = []
+
+    for goal in match.get("goals1") or []:
+        if isinstance(goal, dict):
+            goals.append(format_goal(goal, team1))
+
+    for goal in match.get("goals2") or []:
+        if isinstance(goal, dict):
+            goals.append(format_goal(goal, team2))
+
+    def minute_sort_key(line: str) -> int:
+        found = re.search(r"(\d+)", line)
+        return int(found.group(1)) if found else 999
+
+    return sorted(goals, key=minute_sort_key)
+
+
+def get_red_cards(match: dict[str, Any]) -> list[str]:
+    """
+    OpenFootball обычно не дает полноценную детализацию карточек.
+    Но оставляем поддержку на случай, если в JSON появятся такие поля.
+    """
+    possible_fields = [
+        "redcards",
+        "red_cards",
+        "cards",
+        "bookings",
+        "sendoffs",
+        "dismissals",
     ]
 
+    result = []
+
+    for field in possible_fields:
+        items = match.get(field)
+
+        if not isinstance(items, list):
+            continue
+
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+
+            raw = json.dumps(item, ensure_ascii=False).lower()
+
+            if "red" not in raw and "крас" not in raw:
+                continue
+
+            minute = safe_text(item.get("minute"), "?")
+            name = safe_text(item.get("name") or item.get("player"), "Игрок")
+            team = safe_text(item.get("team"), "Команда")
+
+            result.append(f"{minute}’ — {name} ({team})")
+
+    return result
+
+
+def format_match(match: dict[str, Any]) -> str:
+    team1 = safe_text(match.get("team1"), "Команда 1")
+    team2 = safe_text(match.get("team2"), "Команда 2")
+
+    score1, score2 = get_score_ft(match)
+
+    score_text = f"{score1}:{score2}" if score1 is not None else "?:?"
+    round_name = safe_text(match.get("round"))
+    group_name = safe_text(match.get("group"))
+    ground = safe_text(match.get("ground"))
+
+    lines = [
+        f"<b>{html.escape(team1)} {html.escape(score_text)} {html.escape(team2)}</b>"
+    ]
+
+    details = []
+
+    if group_name:
+        details.append(group_name)
+
     if round_name:
-        lines.append(f"Стадия: {html.escape(round_name)}")
+        details.append(round_name)
 
-    if status == "PEN":
-        penalty = ((match.get("score") or {}).get("penalty") or {})
-        penalty_home = penalty.get("home")
-        penalty_away = penalty.get("away")
+    if ground:
+        details.append(ground)
 
-        if penalty_home is not None and penalty_away is not None:
-            lines.append(f"По пенальти: {penalty_home}:{penalty_away}")
+    if details:
+        lines.append(" / ".join(html.escape(x) for x in details))
 
-    goals = format_goals(events)
-    red_cards = format_red_cards(events)
+    score = match.get("score") or {}
+
+    et = score.get("et")
+    if isinstance(et, list) and len(et) >= 2:
+        lines.append(f"После дополнительного времени: {et[0]}:{et[1]}")
+
+    penalties = score.get("p")
+    if isinstance(penalties, list) and len(penalties) >= 2:
+        lines.append(f"По пенальти: {penalties[0]}:{penalties[1]}")
+
+    goals = get_goals(match)
 
     if goals:
         lines.append("Голы:")
         lines.extend(f"• {html.escape(goal)}" for goal in goals)
     else:
-        if home_goals == 0 and away_goals == 0:
+        if score1 == 0 and score2 == 0:
             lines.append("Голы: нет.")
         else:
-            lines.append("Голы: данные по авторам пока недоступны в API.")
+            lines.append("Голы: авторы голов пока не указаны в источнике.")
+
+    red_cards = get_red_cards(match)
 
     if red_cards:
         lines.append("Удаления:")
         lines.extend(f"• {html.escape(card)}" for card in red_cards)
     else:
-        lines.append("Удаления: нет.")
+        lines.append("Удаления: нет данных в бесплатном источнике.")
 
     return "\n".join(lines)
 
 
-def build_highlights(
-    matches_with_events: list[tuple[dict[str, Any], list[dict[str, Any]]]]
-) -> list[str]:
+def build_highlights(matches: list[dict[str, Any]]) -> list[str]:
     highlights = []
 
-    for match, events in matches_with_events:
-        home = safe_name(
-            (match.get("teams", {}).get("home") or {}).get("name"),
-            "Хозяева",
-        )
-        away = safe_name(
-            (match.get("teams", {}).get("away") or {}).get("name"),
-            "Гости",
-        )
+    for match in matches:
+        team1 = safe_text(match.get("team1"), "Команда 1")
+        team2 = safe_text(match.get("team2"), "Команда 2")
 
-        goals_data = match.get("goals") or {}
-        home_goals = goals_data.get("home")
-        away_goals = goals_data.get("away")
+        score1, score2 = get_score_ft(match)
 
-        if home_goals is not None and away_goals is not None:
-            diff = abs(home_goals - away_goals)
+        if score1 is not None and score2 is not None:
+            diff = abs(score1 - score2)
 
             if diff >= 3:
-                winner = home if home_goals > away_goals else away
+                winner = team1 if score1 > score2 else team2
                 highlights.append(
-                    f"{winner} одержала крупную победу в матче {home} — {away}."
+                    f"{winner} одержала крупную победу в матче {team1} — {team2}."
                 )
 
-        for event in events:
-            event_type = event.get("type")
-            detail = event.get("detail") or ""
-            elapsed = (event.get("time") or {}).get("elapsed") or 0
+            if score1 == score2:
+                highlights.append(f"{team1} и {team2} сыграли вничью.")
 
-            if event_type == "Goal" and elapsed >= 85:
-                player = safe_name(
-                    (event.get("player") or {}).get("name"),
-                    "игрок",
-                )
-                team = safe_name(
-                    (event.get("team") or {}).get("name"),
-                    "команда",
-                )
+        for goal in get_goals(match):
+            found = re.search(r"(\d+)", goal)
 
-                highlights.append(
-                    f"Поздний гол: {player} ({team}) забил на {event_minute(event)}."
-                )
-
-            if event_type == "Card" and (
-                "Red" in detail or "Second Yellow" in detail
-            ):
-                player = safe_name(
-                    (event.get("player") or {}).get("name"),
-                    "игрок",
-                )
-                team = safe_name(
-                    (event.get("team") or {}).get("name"),
-                    "команда",
-                )
-
-                highlights.append(
-                    f"Удаление: {player} ({team}) получил красную карточку "
-                    f"на {event_minute(event)}."
-                )
+            if found and int(found.group(1)) >= 85:
+                highlights.append(f"Поздний гол: {goal}.")
 
     if not highlights:
-        highlights.append("День прошел без разгромов, поздних голов и удалений.")
+        highlights.append("День прошел без разгромов и поздних голов.")
 
     return highlights[:8]
 
 
-def build_bright_players(
-    matches_with_events: list[tuple[dict[str, Any], list[dict[str, Any]]]]
-) -> list[str]:
-    scorers: dict[tuple[str, str], int] = {}
+def build_bright_players(matches: list[dict[str, Any]]) -> list[str]:
+    scorers: dict[str, int] = {}
 
-    for _, events in matches_with_events:
-        for event in events:
-            if event.get("type") != "Goal":
-                continue
+    for match in matches:
+        for field in ["goals1", "goals2"]:
+            for goal in match.get(field) or []:
+                if not isinstance(goal, dict):
+                    continue
 
-            detail = event.get("detail") or ""
+                name = safe_text(goal.get("name"))
 
-            if detail in {"Missed Penalty", "Own Goal"}:
-                continue
+                if not name:
+                    continue
 
-            player = (event.get("player") or {}).get("name")
-            team = (event.get("team") or {}).get("name") or "Команда"
+                goal_type = safe_text(goal.get("type")).lower()
 
-            if not player:
-                continue
+                if "own" in goal_type or "og" in goal_type:
+                    continue
 
-            key = (player, team)
-            scorers[key] = scorers.get(key, 0) + 1
+                scorers[name] = scorers.get(name, 0) + 1
 
-    multi_goals = [
-        f"{player} ({team}) — {goals} гол(а)"
-        for (player, team), goals in scorers.items()
-        if goals >= 2
+    multi = [
+        f"{name} — {count} гол(а)"
+        for name, count in scorers.items()
+        if count >= 2
     ]
 
-    if multi_goals:
-        return multi_goals[:5]
+    if multi:
+        return sorted(multi)[:5]
 
-    one_goal = [
-        f"{player} ({team}) — забил важный гол"
-        for (player, team), goals in scorers.items()
-        if goals == 1
+    single = [
+        f"{name} — отметился голом"
+        for name, count in scorers.items()
+        if count == 1
     ]
 
-    if one_goal:
-        return one_goal[:5]
+    if single:
+        return sorted(single)[:5]
 
     return ["Ярких индивидуальных всплесков по голам не было."]
 
 
-def format_standings_for_matches(matches: list[dict[str, Any]]) -> str:
-    try:
-        standings = get_standings()
-    except Exception as exc:
-        print("Cannot load standings:", exc)
-        return "Таблица: данные временно недоступны."
+def empty_table_row(team: str) -> dict[str, Any]:
+    return {
+        "team": team,
+        "played": 0,
+        "wins": 0,
+        "draws": 0,
+        "losses": 0,
+        "gf": 0,
+        "ga": 0,
+        "gd": 0,
+        "points": 0,
+    }
 
-    if not standings:
-        return "Таблица: данные пока недоступны или стадия без групповой таблицы."
 
-    played_teams = set()
+def add_group_match(
+    table: dict[str, dict[str, Any]],
+    team1: str,
+    team2: str,
+    score1: int,
+    score2: int,
+) -> None:
+    table.setdefault(team1, empty_table_row(team1))
+    table.setdefault(team2, empty_table_row(team2))
 
-    for match in matches:
-        home = (match.get("teams", {}).get("home") or {}).get("name")
-        away = (match.get("teams", {}).get("away") or {}).get("name")
+    table[team1]["played"] += 1
+    table[team2]["played"] += 1
 
-        if home:
-            played_teams.add(home)
+    table[team1]["gf"] += score1
+    table[team1]["ga"] += score2
 
-        if away:
-            played_teams.add(away)
+    table[team2]["gf"] += score2
+    table[team2]["ga"] += score1
 
-    relevant_groups = []
+    if score1 > score2:
+        table[team1]["wins"] += 1
+        table[team2]["losses"] += 1
+        table[team1]["points"] += 3
+    elif score1 < score2:
+        table[team2]["wins"] += 1
+        table[team1]["losses"] += 1
+        table[team2]["points"] += 3
+    else:
+        table[team1]["draws"] += 1
+        table[team2]["draws"] += 1
+        table[team1]["points"] += 1
+        table[team2]["points"] += 1
 
-    for group in standings:
-        group_team_names = {
-            (row.get("team") or {}).get("name")
-            for row in group
-            if (row.get("team") or {}).get("name")
-        }
+    table[team1]["gd"] = table[team1]["gf"] - table[team1]["ga"]
+    table[team2]["gd"] = table[team2]["gf"] - table[team2]["ga"]
 
-        if played_teams & group_team_names:
-            relevant_groups.append(group)
+
+def format_group_standings(
+    all_matches: list[dict[str, Any]],
+    target_matches: list[dict[str, Any]],
+    target_date_str: str,
+) -> str:
+    relevant_groups = {
+        safe_text(match.get("group"))
+        for match in target_matches
+        if safe_text(match.get("group"))
+    }
 
     if not relevant_groups:
-        return "Таблица: для этих матчей отдельная групповая таблица не найдена."
+        return "Таблица: для этой стадии групповая таблица не применяется или группа не указана."
+
+    group_tables: dict[str, dict[str, dict[str, Any]]] = {
+        group: {} for group in relevant_groups
+    }
+
+    for match in all_matches:
+        group = safe_text(match.get("group"))
+
+        if group not in relevant_groups:
+            continue
+
+        if not is_finished(match):
+            continue
+
+        match_date = match_moscow_date_str(match)
+
+        if match_date > target_date_str:
+            continue
+
+        team1 = safe_text(match.get("team1"), "Команда 1")
+        team2 = safe_text(match.get("team2"), "Команда 2")
+        score1, score2 = get_score_ft(match)
+
+        if score1 is None or score2 is None:
+            continue
+
+        add_group_match(group_tables[group], team1, team2, score1, score2)
 
     blocks = []
 
-    for group in relevant_groups:
-        group_name = group[0].get("group", "Группа") if group else "Группа"
-        lines = [f"<b>{html.escape(group_name)}</b>"]
+    for group in sorted(group_tables):
+        rows = list(group_tables[group].values())
 
-        for row in group:
-            rank = row.get("rank")
-            team = safe_name((row.get("team") or {}).get("name"), "Команда")
-            points = row.get("points", 0)
-            played = (row.get("all") or {}).get("played", 0)
-            goals_diff = row.get("goalsDiff", 0)
+        rows.sort(
+            key=lambda row: (
+                row["points"],
+                row["gd"],
+                row["gf"],
+                row["team"],
+            ),
+            reverse=True,
+        )
 
+        lines = [f"<b>{html.escape(group)}</b>"]
+
+        for i, row in enumerate(rows, start=1):
             lines.append(
-                f"{rank}. {html.escape(team)} — {points} очк., "
-                f"матчей: {played}, разница: {goals_diff}"
+                f"{i}. {html.escape(row['team'])} — "
+                f"{row['points']} очк., "
+                f"матчей: {row['played']}, "
+                f"разница: {row['gd']}"
             )
 
         blocks.append("\n".join(lines))
 
-    return "\n\n".join(blocks)
+    return "\n\n".join(blocks) if blocks else "Таблица: данных пока нет."
 
 
-def parse_api_datetime(value: str) -> datetime:
-    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+def format_upcoming(all_matches: list[dict[str, Any]]) -> str:
+    current = now_local()
+    upcoming = []
 
-
-def format_upcoming() -> str:
-    try:
-        fixtures = get_upcoming_matches(limit=10)
-    except Exception as exc:
-        print("Cannot load upcoming matches:", exc)
-        return "Расписание ближайших матчей временно недоступно."
-
-    if not fixtures:
-        return "Ближайшие матчи не найдены."
-
-    lines = []
-
-    for fixture in fixtures[:8]:
-        dt_raw = fixture.get("fixture", {}).get("date")
-
-        if not dt_raw:
+    for match in all_matches:
+        if is_finished(match):
             continue
 
-        dt_local = parse_api_datetime(dt_raw).astimezone(get_tz())
+        try:
+            dt = parse_match_datetime(match)
+        except Exception:
+            continue
 
-        home = safe_name(
-            (fixture.get("teams", {}).get("home") or {}).get("name"),
-            "Команда 1",
-        )
-        away = safe_name(
-            (fixture.get("teams", {}).get("away") or {}).get("name"),
-            "Команда 2",
+        if dt < current:
+            continue
+
+        team1 = safe_text(match.get("team1"), "Команда 1")
+        team2 = safe_text(match.get("team2"), "Команда 2")
+
+        upcoming.append(
+            {
+                "dt": dt,
+                "text": (
+                    f"• {dt.strftime('%d.%m %H:%M')} — "
+                    f"{html.escape(team1)} vs {html.escape(team2)}"
+                ),
+            }
         )
 
-        lines.append(
-            f"• {dt_local.strftime('%d.%m %H:%M')} — "
-            f"{html.escape(home)} vs {html.escape(away)}"
-        )
+    upcoming.sort(key=lambda item: item["dt"])
 
-    return "\n".join(lines) if lines else "Ближайшие матчи не найдены."
+    if not upcoming:
+        return "Ближайшие матчи не найдены."
+
+    return "\n".join(item["text"] for item in upcoming[:8])
 
 
 def build_report(date_str: str) -> str | None:
-    matches = get_finished_matches(date_str)
+    data = load_worldcup_data()
+    all_matches = get_matches(data)
 
-    if not matches:
-        return None
-
-    matches_with_events: list[tuple[dict[str, Any], list[dict[str, Any]]]] = []
-
-    for match in matches:
-        fixture_id = (match.get("fixture") or {}).get("id")
-        events: list[dict[str, Any]] = []
-
-        if fixture_id:
-            try:
-                events = get_fixture_events(int(fixture_id))
-            except Exception as exc:
-                print(f"Cannot load events for fixture {fixture_id}:", exc)
-
-        matches_with_events.append((match, events))
-        time.sleep(0.3)
-
-    match_blocks = [
-        format_match(match, events)
-        for match, events in matches_with_events
+    target_matches = [
+        match
+        for match in all_matches
+        if is_finished(match)
+        and match_moscow_date_str(match) == date_str
     ]
 
-    highlights = build_highlights(matches_with_events)
-    bright_players = build_bright_players(matches_with_events)
+    if not target_matches:
+        return None
+
+    target_matches.sort(key=parse_match_datetime)
 
     date_title = datetime.fromisoformat(date_str).strftime("%d.%m.%Y")
+
+    match_blocks = [format_match(match) for match in target_matches]
+
+    highlights = build_highlights(target_matches)
+    bright_players = build_bright_players(target_matches)
 
     sections = [
         f"🏆 <b>Итоги дня ЧМ-2026 — {date_title}</b>",
@@ -715,11 +706,12 @@ def build_report(date_str: str) -> str | None:
         "<b>Главные моменты</b>\n" + "\n".join(
             f"• {html.escape(item)}" for item in highlights
         ),
-        "<b>Влияние на турнир</b>\n" + format_standings_for_matches(matches),
+        "<b>Влияние на турнир</b>\n"
+        + format_group_standings(all_matches, target_matches, date_str),
         "<b>Новые яркие игроки</b>\n" + "\n".join(
             f"• {html.escape(item)}" for item in bright_players
         ),
-        "<b>Что посмотреть дальше</b>\n" + format_upcoming(),
+        "<b>Что посмотреть дальше</b>\n" + format_upcoming(all_matches),
     ]
 
     return "\n\n".join(sections)
@@ -737,10 +729,6 @@ def run_report_job(date_str: str, force: bool = False, source: str = "manual") -
             print(f"Report for {date_str} already sent.")
             return
 
-        if already_checked_no_matches(date_str) and not force:
-            print(f"No-match check for {date_str} already done.")
-            return
-
         try:
             report = build_report(date_str)
         except Exception as exc:
@@ -751,7 +739,6 @@ def run_report_job(date_str: str, force: bool = False, source: str = "manual") -
 
         if not report:
             print(f"No finished World Cup matches for {date_str}.")
-            mark_no_matches(date_str)
             return
 
         try:
@@ -786,12 +773,6 @@ def start_report_job(
             "date": date_str,
         }
 
-    if already_checked_no_matches(date_str) and not force:
-        return {
-            "status": "already_checked_no_matches",
-            "date": date_str,
-        }
-
     thread = threading.Thread(
         target=run_report_job,
         args=(date_str, force, source),
@@ -811,9 +792,8 @@ def start_report_job(
 def on_startup() -> None:
     print(f"{APP_NAME} started")
     print(f"Timezone: {TIMEZONE}")
-    print(f"League ID: {LEAGUE_ID}")
-    print(f"Season: {SEASON}")
     print(f"Report window: {REPORT_WINDOW_START}-{REPORT_WINDOW_END}")
+    print(f"OpenFootball URL: {OPENFOOTBALL_URL}")
 
     if os.getenv("SEND_TEST_ON_START", "0") == "1":
         try:
@@ -827,7 +807,7 @@ def on_startup() -> None:
             print("Startup Telegram test failed:", exc)
 
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 def root() -> dict[str, Any]:
     return {
         "service": APP_NAME,
@@ -837,7 +817,7 @@ def root() -> dict[str, Any]:
     }
 
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 def health() -> dict[str, Any]:
     state = load_state()
 
@@ -849,12 +829,12 @@ def health() -> dict[str, Any]:
         "report_window": f"{REPORT_WINDOW_START}-{REPORT_WINDOW_END}",
         "inside_report_window": is_inside_report_window(),
         "sent_dates": sorted(state.get("sent", {}).keys()),
-        "no_match_dates": sorted(state.get("no_matches", {}).keys()),
         "job_running": RUN_LOCK.locked(),
+        "data_source": "openfootball/worldcup.json",
     }
 
 
-@app.get("/tick")
+@app.api_route("/tick", methods=["GET", "HEAD"])
 def tick(secret: str = Query(default="")) -> dict[str, Any]:
     check_secret(secret)
 
@@ -883,7 +863,7 @@ def tick(secret: str = Query(default="")) -> dict[str, Any]:
     }
 
 
-@app.get("/run-report")
+@app.api_route("/run-report", methods=["GET", "HEAD"])
 def run_report(
     secret: str = Query(default=""),
     date: str | None = Query(
@@ -911,7 +891,7 @@ def run_report(
     )
 
 
-@app.get("/test-telegram")
+@app.api_route("/test-telegram", methods=["GET", "HEAD"])
 def test_telegram(secret: str = Query(default="")) -> dict[str, Any]:
     check_secret(secret)
 
