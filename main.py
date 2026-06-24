@@ -897,7 +897,7 @@ def test_telegram(secret: str = Query(default="")) -> dict[str, Any]:
 
     try:
         telegram_send(
-            "✅ Тестовое сообщение. Бот итогов ЧМ-2026 работает.\n"
+            "✅ Тестовое сообщение. Бот итогов ЧМ-2026 работает корректно.\n"
             f"Время: "
             f"{html.escape(now_local().strftime('%d.%m.%Y %H:%M:%S'))} "
             f"{html.escape(TIMEZONE)}"
