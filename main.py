@@ -8,6 +8,7 @@ from pathlib import Path
 from datetime import datetime, timedelta, time as dt_time, timezone
 from zoneinfo import ZoneInfo
 from typing import Any
+from contextlib import asynccontextmanager
 
 import requests
 from dotenv import load_dotenv
@@ -27,6 +28,11 @@ TIMEZONE = os.getenv("TIMEZONE", "Europe/Moscow")
 REPORT_WINDOW_START = os.getenv("REPORT_WINDOW_START", "09:30")
 REPORT_WINDOW_END = os.getenv("REPORT_WINDOW_END", "10:30")
 
+# 1 = брать матчи с 00:00 предыдущего дня по Москве до текущего момента.
+# Например, если отчет запускается 26.06 в 09:30,
+# период будет 25.06 00:00 — 26.06 09:30 МСК.
+REPORT_LOOKBACK_DAYS = int(os.getenv("REPORT_LOOKBACK_DAYS", "1"))
+
 OPENFOOTBALL_URL = os.getenv(
     "OPENFOOTBALL_URL",
     "https://raw.githubusercontent.com/openfootball/worldcup.json/master/2026/worldcup.json",
@@ -37,8 +43,6 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 STATE_FILE = DATA_DIR / "state.json"
 
 RUN_LOCK = threading.Lock()
-
-app = FastAPI(title="World Cup Telegram Reporter")
 
 
 def require_env() -> None:
@@ -74,10 +78,6 @@ def now_local() -> datetime:
     return datetime.now(get_tz())
 
 
-def yesterday_local_date_str() -> str:
-    return (now_local().date() - timedelta(days=1)).isoformat()
-
-
 def parse_hhmm(value: str) -> dt_time:
     try:
         hour_str, minute_str = value.strip().split(":", 1)
@@ -100,9 +100,38 @@ def is_inside_report_window(current: datetime | None = None) -> bool:
     return current_time >= start or current_time <= end
 
 
+def get_report_period() -> tuple[datetime, datetime]:
+    """
+    Период для утренней сводки.
+
+    Если сейчас 26.06 09:30 МСК,
+    период будет 25.06 00:00 — 26.06 09:30 МСК.
+
+    Так ночные матчи, завершившиеся после полуночи по Москве,
+    тоже попадут в утренний отчет.
+    """
+    current = now_local()
+
+    start_date = current.date() - timedelta(days=REPORT_LOOKBACK_DAYS)
+
+    period_start = datetime(
+        year=start_date.year,
+        month=start_date.month,
+        day=start_date.day,
+        hour=0,
+        minute=0,
+        second=0,
+        tzinfo=get_tz(),
+    )
+
+    period_end = current
+
+    return period_start, period_end
+
+
 def load_state() -> dict[str, Any]:
     default_state = {
-        "sent": {},
+        "sent_matches": {},
         "errors": [],
     }
 
@@ -117,11 +146,11 @@ def load_state() -> dict[str, Any]:
     if not isinstance(data, dict):
         return default_state
 
-    data.setdefault("sent", {})
+    data.setdefault("sent_matches", {})
     data.setdefault("errors", [])
 
-    if not isinstance(data["sent"], dict):
-        data["sent"] = {}
+    if not isinstance(data["sent_matches"], dict):
+        data["sent_matches"] = {}
 
     if not isinstance(data["errors"], list):
         data["errors"] = []
@@ -136,9 +165,17 @@ def save_state(state: dict[str, Any]) -> None:
     )
 
 
-def mark_sent(date_str: str) -> None:
+def get_sent_match_keys() -> set[str]:
     state = load_state()
-    state["sent"][date_str] = now_local().isoformat()
+    return set(state.get("sent_matches", {}).keys())
+
+
+def mark_sent_matches(match_keys: list[str]) -> None:
+    state = load_state()
+
+    for key in match_keys:
+        state["sent_matches"][key] = now_local().isoformat()
+
     save_state(state)
 
 
@@ -152,10 +189,6 @@ def mark_error(message: str) -> None:
     )
     state["errors"] = state["errors"][-20:]
     save_state(state)
-
-
-def already_sent(date_str: str) -> bool:
-    return date_str in load_state().get("sent", {})
 
 
 def telegram_send(text: str) -> None:
@@ -218,8 +251,14 @@ def load_worldcup_data() -> dict[str, Any]:
 
 
 def safe_text(value: Any, fallback: str = "") -> str:
-    if isinstance(value, str) and value.strip():
-        return value.strip()
+    if value is None:
+        return fallback
+
+    if isinstance(value, str):
+        return value.strip() if value.strip() else fallback
+
+    if isinstance(value, (int, float)):
+        return str(value)
 
     return fallback
 
@@ -258,10 +297,11 @@ def parse_match_datetime(match: dict[str, Any]) -> datetime:
 
     date_obj = datetime.fromisoformat(date_value).date()
 
-    # Примеры:
+    # Возможные форматы времени в OpenFootball:
     # "13:00 UTC-6"
     # "20:00 UTC-5"
     # "18:00 UTC"
+    # "18:00"
     pattern = r"^(\d{1,2}):(\d{2})(?:\s*UTC\s*([+-]\d{1,2}))?"
     match_time = re.search(pattern, time_value)
 
@@ -276,6 +316,7 @@ def parse_match_datetime(match: dict[str, Any]) -> datetime:
             offset_hours = 0
 
         source_tz = timezone(timedelta(hours=offset_hours))
+
         dt = datetime(
             date_obj.year,
             date_obj.month,
@@ -297,11 +338,25 @@ def parse_match_datetime(match: dict[str, Any]) -> datetime:
     return dt.astimezone(get_tz())
 
 
-def match_moscow_date_str(match: dict[str, Any]) -> str:
-    try:
-        return parse_match_datetime(match).date().isoformat()
-    except Exception:
-        return safe_text(match.get("date"))
+def match_key(match: dict[str, Any]) -> str:
+    """
+    Ключ матча для защиты от повторной отправки.
+
+    Если в источнике есть num — используем его.
+    Если нет — собираем ключ из даты, времени, команд и счета.
+    """
+    num = match.get("num")
+
+    if num is not None:
+        return f"num:{num}"
+
+    team1 = safe_text(match.get("team1"), "team1")
+    team2 = safe_text(match.get("team2"), "team2")
+    date_value = safe_text(match.get("date"), "date")
+    time_value = safe_text(match.get("time"), "time")
+    score1, score2 = get_score_ft(match)
+
+    return f"{date_value}|{time_value}|{team1}|{team2}|{score1}:{score2}"
 
 
 def format_goal(goal: dict[str, Any], team: str) -> str:
@@ -311,8 +366,10 @@ def format_goal(goal: dict[str, Any], team: str) -> str:
     detail_parts = []
 
     goal_type = safe_text(goal.get("type")).lower()
+
     if "pen" in goal_type:
         detail_parts.append("пенальти")
+
     if "own" in goal_type or "og" in goal_type:
         detail_parts.append("автогол")
 
@@ -342,46 +399,6 @@ def get_goals(match: dict[str, Any]) -> list[str]:
     return sorted(goals, key=minute_sort_key)
 
 
-def get_red_cards(match: dict[str, Any]) -> list[str]:
-    """
-    OpenFootball обычно не дает полноценную детализацию карточек.
-    Но оставляем поддержку на случай, если в JSON появятся такие поля.
-    """
-    possible_fields = [
-        "redcards",
-        "red_cards",
-        "cards",
-        "bookings",
-        "sendoffs",
-        "dismissals",
-    ]
-
-    result = []
-
-    for field in possible_fields:
-        items = match.get(field)
-
-        if not isinstance(items, list):
-            continue
-
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-
-            raw = json.dumps(item, ensure_ascii=False).lower()
-
-            if "red" not in raw and "крас" not in raw:
-                continue
-
-            minute = safe_text(item.get("minute"), "?")
-            name = safe_text(item.get("name") or item.get("player"), "Игрок")
-            team = safe_text(item.get("team"), "Команда")
-
-            result.append(f"{minute}’ — {name} ({team})")
-
-    return result
-
-
 def format_match(match: dict[str, Any]) -> str:
     team1 = safe_text(match.get("team1"), "Команда 1")
     team2 = safe_text(match.get("team2"), "Команда 2")
@@ -389,15 +406,26 @@ def format_match(match: dict[str, Any]) -> str:
     score1, score2 = get_score_ft(match)
 
     score_text = f"{score1}:{score2}" if score1 is not None else "?:?"
+
     round_name = safe_text(match.get("round"))
     group_name = safe_text(match.get("group"))
     ground = safe_text(match.get("ground"))
+
+    dt_text = ""
+
+    try:
+        dt_text = parse_match_datetime(match).strftime("%d.%m %H:%M МСК")
+    except Exception:
+        pass
 
     lines = [
         f"<b>{html.escape(team1)} {html.escape(score_text)} {html.escape(team2)}</b>"
     ]
 
     details = []
+
+    if dt_text:
+        details.append(dt_text)
 
     if group_name:
         details.append(group_name)
@@ -432,14 +460,6 @@ def format_match(match: dict[str, Any]) -> str:
         else:
             lines.append("Голы: авторы голов пока не указаны в источнике.")
 
-    red_cards = get_red_cards(match)
-
-    if red_cards:
-        lines.append("Удаления:")
-        lines.extend(f"• {html.escape(card)}" for card in red_cards)
-    else:
-        lines.append("Удаления: нет данных в бесплатном источнике.")
-
     return "\n".join(lines)
 
 
@@ -471,7 +491,7 @@ def build_highlights(matches: list[dict[str, Any]]) -> list[str]:
                 highlights.append(f"Поздний гол: {goal}.")
 
     if not highlights:
-        highlights.append("День прошел без разгромов и поздних голов.")
+        highlights.append("Период прошел без разгромов и поздних голов.")
 
     return highlights[:8]
 
@@ -572,7 +592,7 @@ def add_group_match(
 def format_group_standings(
     all_matches: list[dict[str, Any]],
     target_matches: list[dict[str, Any]],
-    target_date_str: str,
+    period_end: datetime,
 ) -> str:
     relevant_groups = {
         safe_text(match.get("group"))
@@ -596,9 +616,12 @@ def format_group_standings(
         if not is_finished(match):
             continue
 
-        match_date = match_moscow_date_str(match)
+        try:
+            match_dt = parse_match_datetime(match)
+        except Exception:
+            continue
 
-        if match_date > target_date_str:
+        if match_dt > period_end:
             continue
 
         team1 = safe_text(match.get("team1"), "Команда 1")
@@ -617,12 +640,11 @@ def format_group_standings(
 
         rows.sort(
             key=lambda row: (
-                row["points"],
-                row["gd"],
-                row["gf"],
+                -row["points"],
+                -row["gd"],
+                -row["gf"],
                 row["team"],
-            ),
-            reverse=True,
+            )
         )
 
         lines = [f"<b>{html.escape(group)}</b>"]
@@ -677,23 +699,64 @@ def format_upcoming(all_matches: list[dict[str, Any]]) -> str:
     return "\n".join(item["text"] for item in upcoming[:8])
 
 
-def build_report(date_str: str) -> str | None:
+def select_matches_for_report(
+    all_matches: list[dict[str, Any]],
+    period_start: datetime,
+    period_end: datetime,
+    force: bool = False,
+) -> list[dict[str, Any]]:
+    sent_keys = set() if force else get_sent_match_keys()
+
+    selected = []
+
+    for match in all_matches:
+        if not is_finished(match):
+            continue
+
+        try:
+            match_dt = parse_match_datetime(match)
+        except Exception:
+            continue
+
+        if not (period_start <= match_dt <= period_end):
+            continue
+
+        key = match_key(match)
+
+        if key in sent_keys:
+            continue
+
+        selected.append(match)
+
+    selected.sort(key=parse_match_datetime)
+
+    return selected
+
+
+def build_report(
+    period_start: datetime,
+    period_end: datetime,
+    force: bool = False,
+) -> tuple[str | None, list[str]]:
     data = load_worldcup_data()
     all_matches = get_matches(data)
 
-    target_matches = [
-        match
-        for match in all_matches
-        if is_finished(match)
-        and match_moscow_date_str(match) == date_str
-    ]
+    target_matches = select_matches_for_report(
+        all_matches=all_matches,
+        period_start=period_start,
+        period_end=period_end,
+        force=force,
+    )
 
     if not target_matches:
-        return None
+        return None, []
 
-    target_matches.sort(key=parse_match_datetime)
+    match_keys = [match_key(match) for match in target_matches]
 
-    date_title = datetime.fromisoformat(date_str).strftime("%d.%m.%Y")
+    period_title = (
+        f"{period_start.strftime('%d.%m %H:%M')} — "
+        f"{period_end.strftime('%d.%m %H:%M')} МСК"
+    )
 
     match_blocks = [format_match(match) for match in target_matches]
 
@@ -701,98 +764,99 @@ def build_report(date_str: str) -> str | None:
     bright_players = build_bright_players(target_matches)
 
     sections = [
-        f"🏆 <b>Итоги дня ЧМ-2026 — {date_title}</b>",
+        f"🏆 <b>Итоги ЧМ-2026</b>\nПериод: {html.escape(period_title)}",
         "<b>Результаты матчей</b>\n\n" + "\n\n".join(match_blocks),
         "<b>Главные моменты</b>\n" + "\n".join(
             f"• {html.escape(item)}" for item in highlights
         ),
         "<b>Влияние на турнир</b>\n"
-        + format_group_standings(all_matches, target_matches, date_str),
+        + format_group_standings(all_matches, target_matches, period_end),
         "<b>Новые яркие игроки</b>\n" + "\n".join(
             f"• {html.escape(item)}" for item in bright_players
         ),
         "<b>Что посмотреть дальше</b>\n" + format_upcoming(all_matches),
     ]
 
-    return "\n\n".join(sections)
+    return "\n\n".join(sections), match_keys
 
 
-def run_report_job(date_str: str, force: bool = False, source: str = "manual") -> None:
+def run_report_job(force: bool = False, source: str = "manual") -> None:
     if not RUN_LOCK.acquire(blocking=False):
         print("Report job is already running. Skip new launch.")
         return
 
     try:
-        print(f"Report job started. source={source}, date={date_str}, force={force}")
+        period_start, period_end = get_report_period()
 
-        if already_sent(date_str) and not force:
-            print(f"Report for {date_str} already sent.")
-            return
+        print(
+            f"Report job started. "
+            f"source={source}, "
+            f"period={period_start.isoformat()} - {period_end.isoformat()}, "
+            f"force={force}"
+        )
 
         try:
-            report = build_report(date_str)
+            report, match_keys = build_report(
+                period_start=period_start,
+                period_end=period_end,
+                force=force,
+            )
         except Exception as exc:
-            message = f"Report build error for {date_str}: {exc}"
+            message = f"Report build error: {exc}"
             print(message)
             mark_error(message)
             return
 
         if not report:
-            print(f"No finished World Cup matches for {date_str}.")
+            print("No new finished World Cup matches for selected period.")
             return
 
         try:
             telegram_send(report)
         except Exception as exc:
-            message = f"Telegram send error for {date_str}: {exc}"
+            message = f"Telegram send error: {exc}"
             print(message)
             mark_error(message)
             return
 
-        mark_sent(date_str)
-        print(f"Report for {date_str} sent successfully.")
+        mark_sent_matches(match_keys)
+        print(f"Report sent successfully. Matches sent: {len(match_keys)}")
 
     finally:
         RUN_LOCK.release()
 
 
-def start_report_job(
-    date_str: str,
-    force: bool = False,
-    source: str = "manual",
-) -> dict[str, Any]:
+def start_report_job(force: bool = False, source: str = "manual") -> dict[str, Any]:
     if RUN_LOCK.locked():
         return {
             "status": "busy",
             "message": "Report job is already running",
         }
 
-    if already_sent(date_str) and not force:
-        return {
-            "status": "already_sent",
-            "date": date_str,
-        }
+    period_start, period_end = get_report_period()
 
     thread = threading.Thread(
         target=run_report_job,
-        args=(date_str, force, source),
+        args=(force, source),
         daemon=True,
     )
     thread.start()
 
     return {
         "status": "scheduled",
-        "date": date_str,
         "force": force,
         "source": source,
+        "period_start": period_start.isoformat(),
+        "period_end": period_end.isoformat(),
     }
 
 
-@app.on_event("startup")
-def on_startup() -> None:
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     print(f"{APP_NAME} started")
     print(f"Timezone: {TIMEZONE}")
     print(f"Report window: {REPORT_WINDOW_START}-{REPORT_WINDOW_END}")
+    print(f"Report lookback days: {REPORT_LOOKBACK_DAYS}")
     print(f"OpenFootball URL: {OPENFOOTBALL_URL}")
 
     if os.getenv("SEND_TEST_ON_START", "0") == "1":
@@ -801,10 +865,21 @@ def on_startup() -> None:
                 "✅ Бот итогов ЧМ-2026 запущен.\n"
                 f"Часовой пояс: {html.escape(TIMEZONE)}\n"
                 f"Окно проверки: "
-                f"{html.escape(REPORT_WINDOW_START)}-{html.escape(REPORT_WINDOW_END)}"
+                f"{html.escape(REPORT_WINDOW_START)}-{html.escape(REPORT_WINDOW_END)}\n"
+                f"Период сбора: с 00:00 предыдущего дня до текущего момента."
             )
         except Exception as exc:
             print("Startup Telegram test failed:", exc)
+
+    yield
+
+    print(f"{APP_NAME} stopped")
+
+
+app = FastAPI(
+    title="World Cup Telegram Reporter",
+    lifespan=lifespan,
+)
 
 
 @app.api_route("/", methods=["GET", "HEAD"])
@@ -820,6 +895,7 @@ def root() -> dict[str, Any]:
 @app.api_route("/health", methods=["GET", "HEAD"])
 def health() -> dict[str, Any]:
     state = load_state()
+    period_start, period_end = get_report_period()
 
     return {
         "service": APP_NAME,
@@ -828,7 +904,9 @@ def health() -> dict[str, Any]:
         "timezone": TIMEZONE,
         "report_window": f"{REPORT_WINDOW_START}-{REPORT_WINDOW_END}",
         "inside_report_window": is_inside_report_window(),
-        "sent_dates": sorted(state.get("sent", {}).keys()),
+        "report_period_start": period_start.isoformat(),
+        "report_period_end": period_end.isoformat(),
+        "sent_matches_count": len(state.get("sent_matches", {})),
         "job_running": RUN_LOCK.locked(),
         "data_source": "openfootball/worldcup.json",
     }
@@ -839,7 +917,7 @@ def tick(secret: str = Query(default="")) -> dict[str, Any]:
     check_secret(secret)
 
     current = now_local()
-    date_str = yesterday_local_date_str()
+    period_start, period_end = get_report_period()
 
     if not is_inside_report_window(current):
         return {
@@ -847,11 +925,11 @@ def tick(secret: str = Query(default="")) -> dict[str, Any]:
             "reason": "outside_report_window",
             "now": current.isoformat(),
             "report_window": f"{REPORT_WINDOW_START}-{REPORT_WINDOW_END}",
-            "target_date": date_str,
+            "period_start": period_start.isoformat(),
+            "period_end": period_end.isoformat(),
         }
 
     result = start_report_job(
-        date_str=date_str,
         force=False,
         source="uptimerobot_tick",
     )
@@ -866,26 +944,11 @@ def tick(secret: str = Query(default="")) -> dict[str, Any]:
 @app.api_route("/run-report", methods=["GET", "HEAD"])
 def run_report(
     secret: str = Query(default=""),
-    date: str | None = Query(
-        default=None,
-        description="YYYY-MM-DD. Empty = yesterday in configured timezone.",
-    ),
     force: bool = Query(default=False),
 ) -> dict[str, Any]:
     check_secret(secret)
 
-    date_str = date or yesterday_local_date_str()
-
-    try:
-        datetime.fromisoformat(date_str)
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid date format. Use YYYY-MM-DD",
-        ) from exc
-
     return start_report_job(
-        date_str=date_str,
         force=force,
         source="manual_run",
     )
@@ -897,7 +960,7 @@ def test_telegram(secret: str = Query(default="")) -> dict[str, Any]:
 
     try:
         telegram_send(
-            "✅ Тестовое сообщение. Бот итогов ЧМ-2026 работает корректно.\n"
+            "✅ Тестовое сообщение. Бот итогов ЧМ-2026 работает.\n"
             f"Время: "
             f"{html.escape(now_local().strftime('%d.%m.%Y %H:%M:%S'))} "
             f"{html.escape(TIMEZONE)}"
