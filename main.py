@@ -35,7 +35,7 @@ REPORT_LOOKBACK_DAYS = int(os.getenv("REPORT_LOOKBACK_DAYS", "1"))
 
 OPENFOOTBALL_URL = os.getenv(
     "OPENFOOTBALL_URL",
-    "https://raw.githubusercontent.com/openfootball/worldcup.json/master/2026/worldcup.json",
+    "https://raw.githubusercontent.com/openfootball/worldcup.json/master/2026/worldcups.json",
 )
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
