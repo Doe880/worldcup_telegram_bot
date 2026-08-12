@@ -31,7 +31,7 @@ REPORT_WINDOW_END = os.getenv("REPORT_WINDOW_END", "10:30")
 # 1 = брать матчи с 00:00 предыдущего дня по Москве до текущего момента.
 # Например, если отчет запускается 26.06 в 09:30,
 # период будет 25.06 00:00 — 26.06 09:30 МСК.
-#yj
+#новый
 REPORT_LOOKBACK_DAYS = int(os.getenv("REPORT_LOOKBACK_DAYS", "1"))
 
 OPENFOOTBALL_URL = os.getenv(
